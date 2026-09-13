@@ -246,7 +246,7 @@
   }
 
   function getIframeSelection() {
-    const iframe = document.querySelector('.docs-texteventtarget-iframe');
+    const iframe = getExecIframe() || document.querySelector('.docs-texteventtarget-iframe');
     if (!iframe) return null;
     try {
       const iframeWindow = iframe.contentWindow;
@@ -273,6 +273,59 @@
   function getSelectedText() {
     const s = getIframeSelection();
     return s?.text || '';
+  }
+
+  // Yank -> system clipboard. Selection lives in the Docs iframe document,
+  // so top-document execCommand alone never copies. Fire-and-forget: Vim
+  // never errors when the clipboard is unavailable.
+  function copyToSystemClipboard(text) {
+    if (!text) return;
+    // 1) Async Clipboard API — writes the exact yanked text.
+    let clipboardTried = false;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        clipboardTried = true;
+        navigator.clipboard.writeText(text).catch(() => {
+          try { fallbackSelectionCopy(); } catch (_) {}
+        });
+      }
+    } catch (_) {}
+    // 2) Synchronous selection copy on the iframe doc (must run while the
+    // yank selection is still active — callers invoke this before collapse).
+    try { fallbackSelectionCopy(); } catch (_) {}
+    if (!clipboardTried) {
+      try { textareaFallbackCopy(text); } catch (_) {}
+    }
+  }
+  function fallbackSelectionCopy() {
+    try {
+      const iframe = getExecIframe();
+      const idoc = iframe && iframe.contentDocument;
+      if (idoc && typeof idoc.execCommand === 'function') {
+        try { idoc.execCommand('copy'); } catch (_) {}
+      }
+    } catch (_) {}
+    try {
+      if (typeof document.execCommand === 'function') document.execCommand('copy');
+    } catch (_) {}
+  }
+  function textareaFallbackCopy(text) {
+    let ta = null;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (_) {}
+    } catch (_) {} finally {
+      try { ta && ta.remove(); } catch (_) {}
+      try { focusEditor(); } catch (_) {}
+    }
   }
 
   // Perf: cache Docs scroll container (re-validated by isConnected).
@@ -1775,17 +1828,23 @@
             Adapter.delete({});
           }
           return;
-        case 'yank':
+        case 'yank': {
+          let clipboardText = '';
           if (selected && selected.length) {
             let toYank = selected;
             let toType = this._lastSelType || 'char';
             if (toType === 'line' && !toYank.endsWith('\n')) toYank += '\n';
             setReg(register, toYank, toType);
+            clipboardText = toYank;
+          } else {
+            // No selection (e.g. count consumed elsewhere): nothing to copy.
           }
-          // keep system clipboard copy as a convenience; internal register always updated
-          try { document.execCommand('copy'); } catch (_) {}
+          // System clipboard copy (fire-and-forget) BEFORE collapsing the
+          // selection — execCommand fallback needs the selection active.
+          try { copyToSystemClipboard(clipboardText || selected || ''); } catch (_) {}
           { const { sel } = this.nav.getSelAndRange(); if (sel && sel.collapseToEnd) sel.collapseToEnd(); }
           return;
+        }
         case 'change':
           if (selected && selected.length) {
             setReg(register, selected, this._lastSelType || 'char');
