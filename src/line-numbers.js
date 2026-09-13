@@ -413,7 +413,7 @@
             });
         } catch (e) {
             // If Browser API is not available, start in enabled mode
-            console.error("Error accessing browser storage:", e);
+            // silent fallback
             enabled = true;
             init();
         }

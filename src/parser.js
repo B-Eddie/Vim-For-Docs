@@ -130,8 +130,13 @@
 
       if (this.haveOperator && !this.motionStarted() && !this.textObjectStarted() && !this.awaitingCharFor) {
         if (isDigitToken(token)) {
-          this.opCountStr += token; this.buffer.push(token);
-          return { kind: 'prefix', keys: [...this.buffer], count: this._countVal(), opCount: this._opCountVal() };
+          // Vim: a leading '0' after an operator is the line_start motion (d0, y0, c0),
+          // not a count. Only treat 0 as a count digit when digits are already present
+          // (e.g. the 0 in d20w).
+          if (!(token === '0' && this.opCountStr === '')) {
+            this.opCountStr += token; this.buffer.push(token);
+            return { kind: 'prefix', keys: [...this.buffer], count: this._countVal(), opCount: this._opCountVal() };
+          }
         }
       }
 
@@ -146,6 +151,7 @@
       let progressed = false;
       let awaitedChar = false;
       const awaitingMotionChar = this.awaitingCharFor === 'motion';
+      const hadOperator = this.haveOperator;
 
       // Consider commands when no operator or text object is in progress,
       // but do NOT consider commands if a motion is awaiting a char (e.g., after 'f').
@@ -171,6 +177,12 @@
           const nextOp = this.operatorNode.children.get(token);
           if (nextOp) {
             this.operatorNode = nextOp; progressed = true;
+            // Track operator-self candidates through multi-key operator prefixes
+            // (e.g. the 'g' of 'guu'), so linewise forms can complete later.
+            const selfBase = this.selfNode || this.operatorSelfRoot;
+            const selfNext = selfBase.children.get(token) ||
+              (selfBase !== this.operatorSelfRoot ? this.operatorSelfRoot.children.get(token) : null);
+            if (selfNext) this.selfNode = selfNext;
             if (nextOp.meta && nextOp.meta.type === 'operator') {
               this.haveOperator = true; this.operatorMeta = nextOp.meta;
               this.motionNode = this.motionsRoot; this.textObjNode = this.textObjectsRoot;
@@ -188,13 +200,18 @@
         }
       }
 
-      const steppedMotion = this._stepMotionTrie(token);
-      progressed = progressed || steppedMotion.progressed;
-      awaitedChar = awaitedChar || steppedMotion.awaitedChar;
-
+      // When this token just completed a multi-key operator (e.g. the 'w' of 'gw'),
+      // it belongs to the operator — it must not also start the motion/text-object.
+      const operatorJustCompleted = !hadOperator && this.haveOperator;
       const allowTextObj = this.haveOperator || (this.runtimeMode === 'visual' || this.runtimeMode === 'visualLine');
-      const steppedText = allowTextObj ? this._stepTextObjTrie(token) : { progressed: false };
-      progressed = progressed || steppedText.progressed;
+      if (!operatorJustCompleted) {
+        const steppedMotion = this._stepMotionTrie(token);
+        progressed = progressed || steppedMotion.progressed;
+        awaitedChar = awaitedChar || steppedMotion.awaitedChar;
+
+        const steppedText = allowTextObj ? this._stepTextObjTrie(token) : { progressed: false };
+        progressed = progressed || steppedText.progressed;
+      }
 
       if (!progressed) {
         const result = { kind: 'invalid' };
@@ -266,12 +283,9 @@
       if (!next && this.motionNode && this.motionNode.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
         next = this.motionNode.children.get(PLACEHOLDER_CHAR); this.args.char = token;
       }
-      if (!next) {
-        next = this.motionsRoot.children.get(token);
-        if (!next && this.motionsRoot.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
-          next = this.motionsRoot.children.get(PLACEHOLDER_CHAR); this.args.char = token;
-        }
-      }
+      // NOTE: no fallback to the trie root when a prefix (e.g. 'g', 'z') is in
+      // progress. Restarting mid-sequence hijacked multi-key operators
+      // (gu/gU/g~) and turned invalid sequences like 'zw' into plain 'w'.
       if (next) { this.motionNode = next; progressed = true; }
       if (this.motionNode && !this.motionNode.meta && this.motionNode.children.has(PLACEHOLDER_CHAR)) {
         this.awaitingCharFor = 'motion'; awaitedChar = true;
@@ -295,13 +309,8 @@
       if (!next && this.commandNode && this.commandNode.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
         next = this.commandNode.children.get(PLACEHOLDER_CHAR); this.args.char = token;
       }
-      if (!next) {
-        const commandRoot = this._getCommandRoot();
-        next = commandRoot.children.get(token);
-        if (!next && commandRoot.children.has(PLACEHOLDER_CHAR) && isSingleCharToken(token)) {
-          next = commandRoot.children.get(PLACEHOLDER_CHAR); this.args.char = token;
-        }
-      }
+      // NOTE: no fallback to the mode root mid-sequence (see _stepMotionTrie).
+      // Falling back turned 'gu' into 'u' (undo), 'gU' into 'U', 'g~' into '~'.
       if (next) { this.commandNode = next; progressed = true; }
       if (this.commandNode && !this.commandNode.meta && this.commandNode.children.has(PLACEHOLDER_CHAR)) {
         this.awaitingCharFor = 'command'; awaitedChar = true;

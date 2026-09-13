@@ -5,11 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Advanced Settings - Vim-For-Docs</title>
   <style>
-    :root {
-      --primary-color: #1a73e8;
-      --border-color: #e0e0e0;
-      --hover-bg: #f5f5f5;
-    }
+    :root { --primary-color: #1a73e8; --border-color: #e0e0e0; --hover-bg: #f5f5f5; }
     *, *::before, *::after { box-sizing: border-box; }
     html { background-color: #f5f7fa; }
     body {
@@ -24,13 +20,7 @@
       color: #333;
       overflow-y: auto;
     }
-    .header {
-      display: flex;
-      align-items: center;
-      margin-bottom: 20px;
-      padding-bottom: 8px;
-      border-bottom: 2px solid var(--primary-color);
-    }
+    .header { display: flex; align-items: center; margin-bottom: 20px; padding-bottom: 8px; border-bottom: 2px solid var(--primary-color); }
     .header h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--primary-color); }
     table { width: 100%; border-collapse: collapse; }
     table tr { border-bottom: 1px solid var(--border-color); transition: background-color 0.3s ease; }
@@ -51,15 +41,6 @@
   <div class="header"><h1>Advanced Settings</h1></div>
   <table>
     <tr>
-      <td><label for="debugSwitch">Debug logging</label></td>
-      <td>
-        <label class="switch">
-          <input type="checkbox" id="debugSwitch" name="debugSwitch">
-          <span class="slider"></span>
-        </label>
-      </td>
-    </tr>
-    <tr>
       <td><label for="useDisplayLinesSwitch">j/k use display lines (like gj/gk)</label></td>
       <td>
         <label class="switch">
@@ -72,9 +53,7 @@
       <td colspan="2"><a href="index.html">Back</a></td>
     </tr>
   </table>
-  <footer>
-    Vim-For-Docs – Advanced Options
-  </footer>
+  <footer>Vim-For-Docs – Advanced Options</footer>
   <script src="advanced.js"></script>
 </body>
 </html>

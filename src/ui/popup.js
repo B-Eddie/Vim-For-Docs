@@ -42,7 +42,7 @@ document.addEventListener("DOMContentLoaded", async function () {
 
   // Load stored settings from browser storage
   try {
-    const data = await window.browserAPI.storage.get(["enabled", "debug", "theme", "lineNumbersEnabled", "hideA11yWarning"]);
+    const data = await window.browserAPI.storage.get(["enabled", "theme", "lineNumbersEnabled", "hideA11yWarning"]);
     enableExtensionCheckbox.checked = data.enabled ?? true;
     lineNumbersCheckbox.checked = data.lineNumbersEnabled ?? true;
     themeDropdown.value = data.theme ?? "default";
@@ -52,9 +52,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     if (a11yWarning && !data.hideA11yWarning) {
       a11yWarning.style.display = 'block';
     }
-  } catch (error) {
-    console.error("Error loading settings:", error);
-  }
+  } catch (_) {}
   
   // Handle dismissing the accessibility warning
   const dismissBtn = document.getElementById('dismissA11yWarning');
@@ -64,9 +62,7 @@ document.addEventListener("DOMContentLoaded", async function () {
         await window.browserAPI.storage.set({ hideA11yWarning: true });
         const a11yWarning = document.getElementById('a11yWarning');
         if (a11yWarning) a11yWarning.style.display = 'none';
-      } catch (error) {
-        console.error("Error dismissing warning:", error);
-      }
+      } catch (_) {}
     });
   }
 
@@ -80,10 +76,7 @@ document.addEventListener("DOMContentLoaded", async function () {
 
     try {
       await window.browserAPI.storage.set(settings);
-      console.log("Settings saved:", settings);
-    } catch (error) {
-      console.error("Error saving settings:", error);
-    }
+    } catch (_) {}
   }
 
   enableExtensionCheckbox.addEventListener("change", saveSettings);

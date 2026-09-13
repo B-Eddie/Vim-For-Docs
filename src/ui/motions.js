@@ -168,13 +168,19 @@ document.addEventListener('DOMContentLoaded', async function () {
   function specialTokenValid(tok) {
     return /^<[A-Za-z][A-Za-z0-9-]*>$/.test(tok);
   }
-  function hasDuplicateTokens(section, candidateTokens, selfItem, typeValue) {
+  function hasDuplicateTokens(section, candidateTokens, selfItem, typeValue, modesValue) {
     const list = Array.isArray(currentConfig[section]) ? currentConfig[section] : [];
     return list.some(it => {
       if (it === selfItem) return false;
       if (!Array.isArray(it.keys)) return false;
       if (typeof typeValue !== 'undefined') {
         if ((it && typeof it === 'object' && 'type' in it ? it.type : undefined) !== typeValue) return false;
+      }
+      // Commands live in per-mode tries: the same keys in disjoint modes
+      // (e.g. 'p' in normal vs visual) are not duplicates.
+      if (section === 'commands' && Array.isArray(modesValue)) {
+        const itModes = Array.isArray(it.modes) ? it.modes : ['normal'];
+        if (!itModes.some(m => modesValue.includes(m))) return false;
       }
       return tokensEqual(it.keys, candidateTokens);
     });
@@ -322,7 +328,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     const updateValid = () => {
       const e1 = validateTokens(tmpKeys);
       const e2 = set.size ? null : 'Select at least one mode';
-      const dup = hasDuplicateTokens('commands', tmpKeys, item);
+      const dup = hasDuplicateTokens('commands', tmpKeys, item, undefined, Array.from(set));
       const err = e1 || e2 || (dup ? 'Duplicate tokens already used in this section' : null);
       if (!err) { v.className = 'status ok'; v.textContent = 'Valid'; }
       else { v.className = 'status err'; v.textContent = 'Invalid: ' + err; }

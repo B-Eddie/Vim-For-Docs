@@ -116,7 +116,7 @@
 
       // Release modifiers
       modKeys.slice().reverse().forEach(m => editorEl.dispatchEvent(new KeyboardEvent('keyup', { key: m, code: m, bubbles: true })));
-    } catch (e) { console.error('sendKeyEvent error', e); }
+    } catch (_) {}
   }
 
   function focusEditor() {
@@ -132,7 +132,7 @@
 
   function simulateClick(el, x = 0, y = 0) {
     if (!el) {
-      console.warn("No element provided to simulateClick");
+      return;
       return;
     }
     const eventSequence = ["mouseover", "mousedown", "mouseup", "click"];
@@ -206,7 +206,7 @@
     if (element) {
       simulateClick(element);
     } else {
-      console.warn(`Menu item with icon class ${item.iconClass} not found`);
+      // menu item not found — silently fall back
       // Try to use keyboard shortcuts as last resort
       if (item === MENU_ITEMS.cut) {
         document.execCommand('cut');
@@ -238,7 +238,7 @@
         range
       };
     } catch(e) {
-      console.warn('[VimExecutor] selection access error', e);
+
       return null;
     }
   }
@@ -446,7 +446,6 @@
       if (typeof sel.modify === 'function') {
         sel.modify('extend', 'forward', 'character');
         let s = sel.toString(); let curLen = s.length || 0;
-        if (window.__VIM_DEBUG__) console.log('[VimDebug] nextStartDelta first step: prevLen=', prevLen, 'curLen=', curLen, 'char=', s.charAt(s.length - 1) || '<empty string>');
         if (curLen > prevLen) {
           let ch = s.charAt(s.length - 1);
           const firstT = this.classify(ch, kind);
@@ -1284,7 +1283,7 @@
     }
     // finishInsert: called on ESC. ops is an array of {type:'text',value} or {type:'bs',count}.
     // For backwards compat, accepts a plain string and converts to a single text op.
-    finishInsert(ops) {
+    async finishInsert(ops) {
       if (!this._pendingInsertCmd) return;
       const entry = this._pendingInsertCmd;
       this._pendingInsertCmd = null;
@@ -1302,6 +1301,32 @@
         textobj: entry.textobj,
         register: entry.register
       };
+      // Vim: a count on i/I/a/A repeats the typed text (e.g. 5ifoobar<Esc>
+      // inserts foobar 5 times). The first copy is already in the document;
+      // insert the remaining copies now. (Change/replace counts apply to the
+      // deletion instead, so they are deliberately excluded.)
+      const extra = (entry.count || 1) - 1;
+      if (extra > 0 && opsArr.length && this._insertCountRepeatsText(entry.id)) {
+        const copies = [];
+        for (let r = 0; r < extra; r++) copies.push(...opsArr);
+        await this._applyInsertOps(copies);
+      }
+    }
+    // Pure character-insert entries whose count multiplies the typed text.
+    // o/O create lines up front and change/replace counts size the deletion.
+    _insertCountRepeatsText(entryId) {
+      return entryId === 'insert_before' || entryId === 'insert_start_line' ||
+        entryId === 'append_after' || entryId === 'append_end_line';
+    }
+    // Ops expanded by the entry count, for '.' replay (mirrors finishInsert).
+    _expandedInsertOps(c) {
+      const ops = c.ops || [];
+      if ((c.entryCount || 1) > 1 && this._insertCountRepeatsText(c.entryId)) {
+        const out = [];
+        for (let r = 0; r < (c.entryCount || 1); r++) out.push(...ops);
+        return out;
+      }
+      return ops;
     }
     async replayLastChange(overrideCount) {
       const c = this._lastChange;
@@ -1323,7 +1348,7 @@
           const savedPending = this._pendingInsertCmd;
           for (let r = 0; r < useCount; r++) {
             await this._replayInsertEntry(c.entryId, c.entryCount || 1);
-            await this._applyInsertOps(c.ops || []);
+            await this._applyInsertOps(this._expandedInsertOps(c));
           }
           this._lastChange = savedChange;
           this._pendingInsertCmd = savedPending;
@@ -1378,7 +1403,6 @@
           for (let i = 0; i < t; i++) { Adapter.home({}); sendKeyEvent('enter', {}); Adapter.up({}); }
           break;
         }
-        case 'append_end_word': this.execMotion('word_end_fwd', 1, false); break;
         default: break;
       }
       if (needsWait) await waitForDocsResponse();
@@ -1394,8 +1418,31 @@
         } else if (op.type === 'bs' && op.count > 0) {
           for (let i = 0; i < op.count; i++) Adapter.backspace({});
           await waitForDocsResponse();
+        } else if (op.type === 'delete_word') {
+          this.deleteWordBackwardSync();
+          await waitForDocsResponse();
+        } else if (op.type === 'dedent') {
+          sendKeyEvent('tab', { shift: true });
+          await waitForDocsResponse();
         }
       }
+    }
+    // Vim <C-W>: erase back to the start of the previous word (synchronous
+    // selection step; callers wait for Docs afterwards).
+    deleteWordBackwardSync() {
+      const d = this.nav.prevStartDelta('word');
+      if (d > 0) {
+        this.nav.moveLeftBy(d, true);
+        this.insertReplacementText('');
+      } else {
+        Adapter.backspace({});
+      }
+    }
+    getRegisterText(name) {
+      const key = (name && typeof name === 'string') ? name : '"';
+      const reg = this.registers[key] || this.registers['"'];
+      if (typeof reg === 'string') return reg;
+      return (reg && reg.text) || '';
     }
 
     // R-mode replay: each text char overwrites the char under cursor (extend right + replace),
@@ -1552,23 +1599,11 @@
           break;
         case 'up':
           if (curMode === 'visualLine') { this.visualLineUp(count); break; }
-          if (this.settingsAPI.getUseDisplayLines()) {
-            repeat(count, () => Adapter.up(S));
-          } else {
-            Adapter.right(S)
-            repeat(count, () => Adapter.ctrlUp(S));
-            Adapter.left(S);
-          }
+          repeat(count, () => Adapter.up(S));
           break;
         case 'down':
           if (curMode === 'visualLine') { this.visualLineDown(count); break; }
-          if (this.settingsAPI.getUseDisplayLines()) {
-            repeat(count, () => Adapter.down(S));
-          } else {
-            Adapter.right(S)
-            repeat(count, () => Adapter.ctrlDown(S));
-            Adapter.left(S);
-          }
+          repeat(count, () => Adapter.down(S));
           break;
         case 'display_up':
           if (curMode === 'visualLine') { this.visualLineUp(count); break; }
@@ -1596,7 +1631,7 @@
         case 'line_end': Adapter.end(S); break;
         case 'last_non_blank': { Adapter.end(S); let d=0; while (true){ const ch=nav.peekLeftCharN(d+1); if (ch==null) break; if (!nav.isWhitespace(ch)) break; d++; if (d>nav.MAX_SCAN) break; } if (d>0) nav.moveLeftBy(d, withShift); break; }
         // All 'word' motions use scanning; 'WORD' motions use non-whitespace scanning
-        case 'word_start_fwd': for (let i=0;i<count;i++){ const d=nav.nextStartDelta('word'); if (window.__VIM_DEBUG__) console.log('[VimDebug] word_start_fwd delta=', d); if (d>0) nav.moveRightBy(d, withShift);} break;
+        case 'word_start_fwd': for (let i=0;i<count;i++){ const d=nav.nextStartDelta('word'); if (d>0) nav.moveRightBy(d, withShift);} break;
         case 'WORD_start_fwd': for (let i=0;i<count;i++){ const d=nav.nextStartDelta('WORD'); if (d>0) nav.moveRightBy(d, withShift);} break;
         case 'word_end_fwd':   for (let i=0;i<count;i++){ const d=nav.nextEndDelta('word'); if (d>0) nav.moveRightBy(d, withShift);} break;
         case 'WORD_end_fwd':   for (let i=0;i<count;i++){ const d=nav.nextEndDelta('WORD'); if (d>0) nav.moveRightBy(d, withShift);} break;
@@ -1604,8 +1639,14 @@
         case 'WORD_start_back':for (let i=0;i<count;i++){ const d=nav.prevStartDelta('WORD'); if (d>0) nav.moveLeftBy(d, withShift);} break;
         case 'word_end_back':  for (let i=0;i<count;i++){ const d=nav.prevEndDelta('word'); if (d>0) nav.moveLeftBy(d, withShift);} break;
         case 'WORD_end_back':  for (let i=0;i<count;i++){ const d=nav.prevEndDelta('WORD'); if (d>0) nav.moveLeftBy(d, withShift);} break;
-        case 'first_line': Adapter.ctrlHome(S); break;
-        case 'last_line': Adapter.ctrlEnd(S); break;
+        case 'first_line':
+          if (count > 1) { this.gotoLine(count, withShift); }
+          else Adapter.ctrlHome(S);
+          break;
+        case 'last_line':
+          if (count > 1) { this.gotoLine(count, withShift); }
+          else Adapter.ctrlEnd(S);
+          break;
         case 'screen_top': Adapter.pageUp(S); break;
         case 'screen_middle': scrollSelectionIntoView('center'); break;
         case 'screen_bottom': Adapter.pageDown(S); break;
@@ -1629,16 +1670,6 @@
         case 'repeat_ft_back': { const lf=this.lastFind; if (!lf) break; const times=count; if (lf.dir==='right'){ for (let i=0;i<times;i++){ const d=nav.findLeftDelta(lf.target, lf.till); if (d>0) nav.moveLeftBy(d, withShift);} } else { for (let i=0;i<times;i++){ const d=nav.findRightDelta(lf.target, lf.till); if (d>0) nav.moveRightBy(d, withShift);} } break; }
         default: this.stub('motion:' + id); break;
       }
-      // Debug: print caret index after motion (with small delay to let Google Docs process key events)
-      try {
-        if (window.__VIM_DEBUG__) {
-          // Fire-and-forget debug log after Docs reacts to the motion.
-          waitForDocsResponse({ timeoutMs: 30 }).then(() => {
-            const ci = this.nav.caretIndex();
-            console.log('[VimDebug] motion', id, 'index=', ci.index, 'min=', ci.min, 'max=', ci.max);
-          });
-        }
-      } catch (_) {}
     }
 
     selectByMotion(motion, count) {
@@ -1657,14 +1688,22 @@
       switch (op) {
         case 'delete':
           if (selected && selected.length) {
-            setReg(register, selected, this._lastSelType || 'char');
+            let toYank = selected;
+            let toType = this._lastSelType || 'char';
+            if (toType === 'line' && !toYank.endsWith('\n')) toYank += '\n';
+            setReg(register, toYank, toType);
             this.insertReplacementText('');
           } else {
             Adapter.delete({});
           }
           return;
         case 'yank':
-          if (selected && selected.length) setReg(register, selected, this._lastSelType || 'char');
+          if (selected && selected.length) {
+            let toYank = selected;
+            let toType = this._lastSelType || 'char';
+            if (toType === 'line' && !toYank.endsWith('\n')) toYank += '\n';
+            setReg(register, toYank, toType);
+          }
           // keep system clipboard copy as a convenience; internal register always updated
           try { document.execCommand('copy'); } catch (_) {}
           { const { sel } = this.nav.getSelAndRange(); if (sel && sel.collapseToEnd) sel.collapseToEnd(); }
@@ -1759,7 +1798,7 @@
       this.applyOperator(operator, result.register);
     }
 
-    execOperatorSelf(result) {
+    async execOperatorSelf(result) {
       const { operator, count = 1 } = result;
       this.selectWholeLines(count);
       this._lastSelType = 'line';
@@ -1769,7 +1808,12 @@
       } else {
         this.setLastChange({ type: 'operator_self', operator, count, register: result.register });
       }
+      await waitForDocsResponse();
       this.applyOperator(operator, result.register);
+      if (operator === 'delete' || operator === 'yank') {
+        // Let Docs finish the deletion/yank before the next keystroke
+        await waitForDocsResponse();
+      }
     }
 
     async execOperatorTextObj(result) {
@@ -2236,7 +2280,68 @@
       return null;
     }
 
+    // Jump to the start of 1-based document line n (clamped), extending the
+    // selection when withShift (operators, visual mode).
+    gotoLine(n, withShift=false) {
+      try {
+        const text = this.nav.extractDocumentText();
+        if (text == null) return false;
+        const lines = text.split('\n');
+        const target = Math.max(1, Math.min(n || 1, Math.max(1, lines.length)));
+        let idx = 0;
+        for (let i = 1; i < target; i++) idx += lines[i - 1].length + 1;
+        if (this.nav.setCaretIndex(idx, withShift)) return true;
+      } catch (_) {}
+      try {
+        if (withShift) Adapter.ctrlEnd({ shift: true }); else Adapter.ctrlHome({});
+      } catch (_) {}
+      return false;
+    }
+
     selectWholeLines(count) {
+      // Vim-accurate linewise selection: use document text + index so we
+      // reliably grab whole lines (including the trailing newline). Falls
+      // back to the legacy Ctrl+Up/Ctrl+Down trick if the mirror is missing.
+      try {
+        const text = this.nav.extractDocumentText();
+        const ci = this.nav.caretIndex();
+        if (text != null && ci && typeof ci.index === 'number' && ci.index >= 0) {
+          const lines = text.split('\n');
+          const offsets = [0];
+          for (let i = 0; i < lines.length - 1; i++) offsets.push(offsets[i] + lines[i].length + 1);
+          // Find the line containing ci.index: [offsets[i], offsets[i+1])
+          let curLine = 0;
+          for (let i = 0; i < lines.length; i++) {
+            const start = offsets[i];
+            const next = (i + 1 < offsets.length) ? offsets[i + 1] : text.length + 1;
+            if (ci.index < next) { curLine = i; break; }
+            if (i === lines.length - 1) curLine = i;
+          }
+          if (curLine < 0) curLine = 0;
+          if (curLine >= lines.length) curLine = Math.max(0, lines.length - 1);
+          const startIdx = offsets[curLine] ?? 0;
+          let endIdx;
+          if (curLine + count >= lines.length) {
+            endIdx = text.length;
+          } else {
+            endIdx = offsets[curLine + count];
+          }
+          // Don't select the synthetic trailing empty line after the final newline
+          if (lines.length && lines[lines.length - 1] === '' && endIdx === text.length && startIdx < text.length) {
+            // endIdx already at text.length which is correct (includes final newline)
+          }
+          this.nav.setCaretIndex(startIdx, false);
+          this.nav.setCaretIndex(endIdx, true);
+          // Verify we actually got a range; fall through to key trick if not
+          const selText = getSelectedText();
+          if (selText && selText.length) {
+            this._lastSelType = 'line';
+            return;
+          }
+          // If selection came back empty (e.g. mirror race), try fallback
+        }
+      } catch (_) {}
+      // Fallback: legacy paragraph selection
       Adapter.ctrlUp({});
       Adapter.ctrlDown({ shift: true });
       if (count > 1) {
@@ -2273,49 +2378,109 @@
       if (!text) return;
       const ci = this.nav.caretIndex();
       if (!ci || ci.index < 0) return;
-      // Build matcher
-      let matcherType = wordBound ? 'regex' : 'literal';
+      // Build matcher — supports Vim escapes (\c / \C), magic, and word-bound (* and #).
+      // Literals are still treated as literals; regex paths go through vimPatToRegExp so
+      // Vim extensions like \< \> work and magic translates to JS RegExp.
       let lit = null, re = null;
-      if (matcherType === 'literal') {
-        lit = pattern;
-      } else {
+      const isRegex = wordBound || /\\[cCvVmM<>+?|(){}\[\]^*.$]/.test(pattern) || /[*\[\]]/.test(pattern);
+      if (wordBound) {
         const pat = `\\b${this._escapeRegExp(pattern)}\\b`;
-        re = new RegExp(pat, 'g');
+        re = new RegExp(pat, (this._searchIgnoreCase ? 'i' : '') + 'g');
+      } else if (isRegex) {
+        // Check for ignorecase override (from \c)
+        let pat = pattern;
+        const forceOn = pat.indexOf('\\c') !== -1;
+        const forceOff = pat.indexOf('\\C') !== -1;
+        if (forceOn || forceOff) {
+          pat = pat.replace(/\\c/g, '').replace(/\\C/g, '');
+          const flag = forceOff ? '' : 'i';
+          try { re = this.vimPatToRegExp(pat, flag); } catch (_) { re = null; }
+          if (!re) { lit = pat; } else {
+            // re ready
+          }
+        } else if (this._searchIgnoreCaseOverride != null) {
+          try { re = this.vimPatToRegExp(pat, this._searchIgnoreCaseOverride ? 'i' : ''); } catch (_) { lit = pat; }
+          if (re) { /* ok */ } else lit = pat;
+        } else {
+          try { re = this.vimPatToRegExp(pat, this._searchIgnoreCase ? 'i' : ''); } catch (_) { lit = pat; }
+          if (re) { /* ok */ } else lit = pat;
+        }
+        if (re) {
+          // Use regex path; clear lit so step functions use re
+          lit = null;
+        } else {
+          // Fallback to literal search case-insensitively if ignorecase is set
+          if (this._searchIgnoreCase || this._searchIgnoreCaseOverride) {
+            try {
+              re = new RegExp(this._escapeRegExp(pat), (this._searchIgnoreCase ? 'i' : '') + 'g');
+              lit = null;
+            } catch (_) { lit = pat; re = null; }
+          } else {
+            lit = pattern;
+          }
+        }
+      } else {
+        // Plain literal
+        if (this._searchIgnoreCase || this._searchIgnoreCaseOverride) {
+          try { re = new RegExp(this._escapeRegExp(pattern), 'ig'); lit = null; } catch (_) { lit = pattern; }
+        } else {
+          lit = pattern;
+        }
       }
+
       const stepForward = (startIdx) => {
-        if (matcherType === 'literal') return text.indexOf(lit, Math.max(0, startIdx));
+        if (lit != null) {
+          if (this._searchIgnoreCase || this._searchIgnoreCaseOverride) {
+            const lowText = text.toLowerCase();
+            return lowText.indexOf(String(lit).toLowerCase(), Math.max(0, startIdx));
+          }
+          return text.indexOf(lit, Math.max(0, startIdx));
+        }
         re.lastIndex = Math.max(0, startIdx);
         const m = re.exec(text);
         return m ? m.index : -1;
       };
       const stepBackward = (startIdx) => {
-        if (matcherType === 'literal') return text.lastIndexOf(lit, Math.max(0, startIdx));
-        // Regex backward: scan all matches up to startIdx and pick the last
+        if (lit != null) {
+          if (this._searchIgnoreCase || this._searchIgnoreCaseOverride) {
+            const lowText = text.toLowerCase();
+            return lowText.lastIndexOf(String(lit).toLowerCase(), Math.max(0, startIdx));
+          }
+          return text.lastIndexOf(lit, Math.max(0, startIdx));
+        }
         let idx = -1; re.lastIndex = 0; let m;
         while ((m = re.exec(text)) && m.index <= Math.max(0, startIdx)) { idx = m.index; if (re.lastIndex === m.index) re.lastIndex++; }
         return idx;
       };
 
-      // Start positions exclude current caret for forward, include up to caret for backward
+      // Wrapping search like real Vim — forward wraps to top, backward wraps to bottom.
+      // Also wraps for n/N across multiple times.
       let pos = ci.index;
+      let wrapped = false;
       const doOne = (direction) => {
-        if (direction === 'forward') {
-          return stepForward(pos + 1);
-        } else {
-          return stepBackward(pos - 1);
-        }
+        if (direction === 'forward') return stepForward(pos + 1);
+        return stepBackward(pos - 1);
       };
-
       let found = -1;
       for (let i = 0; i < Math.max(1, times); i++) {
-        const idx = doOne(dir);
-        if (idx === -1) { found = -1; break; }
+        let idx = doOne(dir);
+        if (idx === -1) {
+          // Try wrap
+          const wrapIdx = (dir === 'forward') ? stepForward(0) : stepBackward(text.length);
+          if (wrapIdx !== -1) { idx = wrapIdx; wrapped = true; }
+          else { found = -1; break; }
+        }
         found = idx; pos = idx;
       }
       if (found !== -1) {
         this._recordJumpBeforeMove();
         this.moveToCaretIndex(found);
         this._lastSearch = { pattern, dir };
+        this._searchHlCleared = false;
+        if (wrapped) this._vimMsg('search hit ' + (dir === 'forward' ? 'BOTTOM' : 'TOP') + ', continuing at ' + (dir === 'forward' ? 'TOP' : 'BOTTOM'), false);
+        else this._vimMsg('/' + pattern, false);
+      } else {
+        this._vimMsg('E486: Pattern not found: ' + pattern, true);
       }
     }
 
@@ -2345,7 +2510,6 @@
           this.modeAPI.setMode('insert');
           return;
         }
-        case 'append_end_word': this.startInsert('append_end_word', count); this.execMotion('word_end_fwd', 1, false); this.modeAPI.setMode('insert'); return;
         case 'insert_register': {
           const name = (result.command && result.command.args && result.command.args.char) || '"';
           const reg = this.registers[name] || this.registers['"'];
@@ -2354,6 +2518,19 @@
           this.insertReplacementText(textVal);
           return;
         }
+        // Insert-mode control commands (previously parsed but silently dropped).
+        case 'insert_delete_char_back': Adapter.backspace({}); return;
+        case 'insert_delete_word': {
+          this.deleteWordBackwardSync();
+          await waitForDocsResponse();
+          return;
+        }
+        case 'insert_line_break': sendKeyEvent('enter', {}); return;
+        case 'insert_indent': sendKeyEvent('tab', {}); return;
+        case 'insert_dedent': sendKeyEvent('tab', { shift: true }); return;
+        case 'insert_autocomplete_next': Adapter.down({}); return;
+        case 'insert_autocomplete_prev': Adapter.up({}); return;
+        case 'insert_temp_normal': return; // handled by the content script (<C-O>)
 
         // Replace / join / substitute / to EOL
         case 'replace_char': {
@@ -2600,19 +2777,11 @@
 
         // Search
         case 'search_forward': {
-          const last = (this._lastSearch && this._lastSearch.pattern) || '';
-          let pattern = '';
-          try { pattern = prompt('/ pattern:', last) || ''; } catch (_) { pattern = last || ''; }
-          if (!pattern) return;
-          this._searchFindAndMove(pattern, 'forward', 1, false);
+          // Search is handled by the bottom command-line ("/" in content.js).
+          // Keep this as a fallback if triggered programmatically.
           return;
         }
         case 'search_backward': {
-          const last = (this._lastSearch && this._lastSearch.pattern) || '';
-          let pattern = '';
-          try { pattern = prompt('? pattern:', last) || ''; } catch (_) { pattern = last || ''; }
-          if (!pattern) return;
-          this._searchFindAndMove(pattern, 'backward', 1, false);
           return;
         }
         case 'search_next': {
@@ -2696,8 +2865,10 @@
           return;
         }
         case 'visual_yank':   { this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char'; this.applyOperator('yank',   result.register); this.modeAPI.setMode('normal'); return; }
-        case 'visual_delete': { this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char'; this.applyOperator('delete', result.register); this.modeAPI.setMode('normal'); return; }
-        case 'visual_change': { this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char'; this.applyOperator('change', result.register); /* applyOperator sets insert */ return; }
+        case 'visual_delete':
+        case 'visual_delete_char': { this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char'; this.applyOperator('delete', result.register); this.modeAPI.setMode('normal'); return; }
+        case 'visual_change':
+        case 'visual_substitute': { this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char'; this.applyOperator('change', result.register); /* applyOperator sets insert */ return; }
         case 'visual_indent': {
           this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char';
           this.applyOperator('indent', result.register);
@@ -2735,6 +2906,25 @@
           this.setLastChange({ type: 'command', id: 'visual_uppercase', count: 1 });
           return;
         }
+        case 'visual_paste':
+        case 'visual_paste_before': {
+          // Vim v_p: replace the selection with the register text. Plain 'p'
+          // puts the replaced text into the unnamed register; 'P' preserves it.
+          const keepRegister = (id === 'visual_paste_before');
+          const name = (result.register && typeof result.register === 'string') ? result.register : '"';
+          const reg = this.registers[name] || this.registers['"'];
+          const textVal = typeof reg === 'string' ? reg : (reg?.text || '');
+          const selected = getSelectedText();
+          if (selected && !keepRegister) {
+            this.registers['"'] = { text: selected, type: this._lastSelType || 'char' };
+          }
+          const times = Math.max(1, count || 1);
+          if (textVal) this.insertReplacementText(textVal.repeat(times));
+          this._lastSelType = (this.modeAPI.getMode() === 'visualLine') ? 'line' : 'char';
+          this.setLastChange({ type: 'command', id, count: times, register: result.register });
+          this.modeAPI.setMode('normal');
+          return;
+        }
 
         // Exit modes
         case 'exit_mode':
@@ -2752,7 +2942,6 @@
 
         // Searches / marks / jumps / inc-dec (stubs)
         default:
-          if (id.startsWith('insert_')) return;
           if (id.startsWith('search_')) return this.stub('search');
           if (id.startsWith('set_mark') || id.startsWith('jump_') || id === 'change_next' || id === 'change_prev') return this.stub('marks_jumps');
           if (id === 'increment' || id === 'decrement') return this.stub('inc_dec');
@@ -2824,20 +3013,21 @@
       const times = Math.max(1, opts.times || 1);
 
       if (kind === 'char') {
-        // collapse non-collapsed selection at start/end
         const { sel, range } = nav.getSelAndRange();
         if (sel && range && !sel.isCollapsed) {
-          range.collapse(before /* collapse at start for P, end for p */);
+          range.collapse(before);
           sel.removeAllRanges(); sel.addRange(range);
         }
         if (!before) {
-          // 'p' -> insert after cursor: move one right if possible
-          nav.moveRightBy(1, false);
+          // p inserts after cursor — don't cross a line break
+          const peek = nav.peekRightCharN(1);
+          if (peek != null && !nav.isNewline(peek)) nav.moveRightBy(1, false);
+          // if peek is newline or at doc end, staying put inserts after the
+          // last character on the line (Vim's EOL behavior)
         }
         const payload = times > 1 ? textVal.repeat(times) : textVal;
         this.insertReplacementText(payload);
         if (cursorStay) {
-          // Wait for paste to apply, then move back by text length to restore cursor.
           await waitForDocsResponse();
           const len = payload.length;
           if (len > 0) nav.moveLeftBy(len, false);
@@ -2845,34 +3035,73 @@
         return;
       }
 
-      // linewise
+      // linewise — always insert at a clean line boundary so we never split a line
       let unit = textVal;
-      // normalize to end with a newline
       if (!unit.endsWith('\n')) unit = unit + '\n';
       if (adjustIndent) {
         const baseIndent = this.computeCurrentLineIndent();
         unit = this.indentBlock(unit, baseIndent);
       }
       const repeated = times > 1 ? unit.repeat(times) : unit;
+      try {
+        const text = nav.extractDocumentText();
+        const ci = nav.caretIndex();
+        if (text != null && ci && typeof ci.index === 'number' && ci.index >= 0) {
+          const lines = text.split('\n');
+          const offsets = [0];
+          for (let i = 0; i < lines.length - 1; i++) offsets.push(offsets[i] + lines[i].length + 1);
+          let curLine = 0;
+          for (let i = 0; i < lines.length; i++) {
+            const nxt = (i + 1 < offsets.length) ? offsets[i + 1] : text.length + 1;
+            if (ci.index < nxt) { curLine = i; break; }
+            if (i === lines.length - 1) curLine = i;
+          }
+          let insIdx;
+          if (before) {
+            insIdx = offsets[curLine] ?? 0;
+          } else {
+            insIdx = (curLine + 1 < offsets.length) ? offsets[curLine + 1] : text.length;
+          }
+          // When pasting below the very last line that has no trailing newline,
+          // we need to ensure a separator newline so the paste starts on its own line.
+          if (!before && text.length > 0 && !text.endsWith('\n') && curLine === lines.length - 1) {
+            // insIdx == text.length, payload currently starts without leading newline
+            // insert a leading newline before the repeated block
+            nav.setCaretIndex(insIdx, false);
+            this.insertReplacementText('\n' + repeated);
+          } else {
+            nav.setCaretIndex(insIdx, false);
+            this.insertReplacementText(repeated);
+          }
+          if (cursorStay) {
+            await waitForDocsResponse();
+            try { nav.setCaretIndex(insIdx, false); } catch (_) {}
+          } else {
+            // Vim: after linewise p/P cursor lands on first non-blank of the first pasted line.
+            await waitForDocsResponse();
+            try {
+              nav.setCaretIndex(insIdx, false);
+              const d = nav.firstNonBlankForwardDelta();
+              if (d > 0) nav.moveRightBy(d, false);
+            } catch (_) {}
+          }
+          return;
+        }
+      } catch (_) {}
+      // Fallback to viewport-based logic if mirror is unavailable
       if (before) {
-        // 'P' -> put above: go to start of current line
         const toStart = nav.prevLineBoundaryDelta();
         if (toStart > 0) nav.moveLeftBy(toStart, false);
         this.insertReplacementText(repeated);
       } else {
-        // 'p' -> put below: go to end of current line, insert newline+block(s)
         Adapter.end({});
-        // ensure a leading newline to paste on next line
         const payload = (repeated.startsWith('\n') ? repeated : ('\n' + repeated));
         this.insertReplacementText(payload);
       }
       if (cursorStay) {
-        // For linewise, wait for paste, then move up by number of lines pasted.
         await waitForDocsResponse();
         const lines = repeated.split('\n').length - 1;
-        if (lines > 0) {
-          for (let i = 0; i < lines; i++) Adapter.up({});
-        }
+        if (lines > 0) for (let i = 0; i < lines; i++) Adapter.up({});
       }
     }
 
@@ -2937,11 +3166,299 @@
       }
     }
 
-    stub(name) {
+
+    _vimMsg(text, isError) {
       try {
-        if (window.__VIM_DEBUG__) console.warn('[VimExecutor] stub', name);
+        if (typeof window !== 'undefined' && window.__VIM_SHOWMSG__) window.__VIM_SHOWMSG__(text, !!isError);
+        else if (typeof window !== 'undefined' && window.__VIM_UI__ && window.__VIM_UI__.setMessage) window.__VIM_UI__.setMessage(text, !!isError);
       } catch (_) {}
     }
+
+    clearSearchHighlight() {
+      // No highlight to clear in Docs; just drop last search state for :noh display.
+      // Keep _lastSearch for n/N but mark as cleared for hl state.
+      this._searchHlCleared = true;
+    }
+
+    // ---- Ex helpers ----
+    exGotoLine(n) {
+      try {
+        const text = this.nav.extractDocumentText();
+        if (!text) return;
+        if (n < 1) n = 1;
+        let line = 1;
+        let idx = 0;
+        while (line < n && idx < text.length) {
+          if (text[idx] === '\n') line++;
+          idx++;
+        }
+        // idx now points at start of line n (or end)
+        this._recordJumpBeforeMove();
+        this.moveToCaretIndex(idx);
+        this._vimMsg(String(n), false);
+      } catch (_) {}
+    }
+
+    _regFlagsToJS(vimFlags) {
+      const f = String(vimFlags || '');
+      let out = '';
+      if (f.indexOf('i') !== -1 || this._searchIgnoreCase) out += 'i';
+      return out;
+    }
+
+    vimPatToRegExp(pat, flagsStr) {
+      // Translate Vim magic to JS RegExp. Shared logic with content.js but kept
+      // here for ex/substitute use without content.js flag parsing.
+      let js = '';
+      for (let i = 0; i < pat.length; i++) {
+        const ch = pat[i];
+        if (ch === '\\' && i + 1 < pat.length) {
+          const nxt = pat[i + 1];
+          if (nxt === 'c' || nxt === 'C' || nxt === 'v' || nxt === 'V' || nxt === 'm' || nxt === 'M') { i++; continue; }
+          if (nxt === '<') { js += '\\b(?=\\w)'; i++; continue; }
+          if (nxt === '>') { js += '\\b'; i++; continue; }
+          if ('+?|(){}'.indexOf(nxt) !== -1) { js += nxt; i++; continue; }
+          if ('.*[]^$\\'.indexOf(nxt) !== -1) { js += '\\' + nxt; i++; continue; }
+          js += nxt; i++; continue;
+        }
+        if ('+?|(){}'.indexOf(ch) !== -1) { js += '\\' + ch; continue; }
+        js += ch;
+      }
+      const flags = this._regFlagsToJS(flagsStr);
+      try { return new RegExp(js, flags ? flags + 'g' : 'g'); } catch (_) { return new RegExp(this._escapeRegExp(pat), flags ? flags + 'g' : 'g'); }
+    }
+
+    exSubstitute(opts) {
+      try {
+        const pat = String(opts.pat || '');
+        const rep = String(opts.rep || '');
+        const range = String(opts.range || '');
+        const doGlobal = !!opts.global;
+        const flagsStr = String(opts.flags || '');
+        const ignore = flagsStr.indexOf('i') !== -1;
+        // Build regex for the pattern
+        const savedIgnore = this._searchIgnoreCase;
+        if (ignore) this._searchIgnoreCase = true;
+        const re = this.vimPatToRegExp(pat, ignore ? 'i' : '');
+        if (ignore) this._searchIgnoreCase = savedIgnore;
+
+        const text = this.nav.extractDocumentText();
+        if (!text) { this._vimMsg('E486: Pattern not found: ' + pat, true); return; }
+
+        // Determine range: "%" = whole file; "a,b" = lines; "" or current line not yet scoped — do whole file for now
+        let scopeStart = 0, scopeEnd = text.length;
+        if (range && range !== '%') {
+          const m = /^([0-9]+),([0-9]+)$/.exec(range);
+          if (m) {
+            const sLine = Math.max(1, parseInt(m[1], 10));
+            const eLine = Math.max(1, parseInt(m[2], 10));
+            scopeStart = this.lineToIndex(sLine);
+            scopeEnd = this.lineToIndex(eLine + 1); // exclusive next line start
+          } else if (/^[0-9]+$/.test(range)) {
+            const n = Math.max(1, parseInt(range, 10));
+            scopeStart = this.lineToIndex(n);
+            scopeEnd = this.lineToIndex(n + 1);
+          }
+        }
+
+        const slice = text.slice(scopeStart, scopeEnd);
+        // Translate Vim replacement escapes: \& \0 whole match, \1..\9 groups, \n newline, \r newline
+        const jsRep = rep.replace(/\\n/g, '\n').replace(/\\r/g, '\n');
+
+        let count = 0;
+        const replacer = function () {
+          count++;
+          const args = Array.prototype.slice.call(arguments);
+          const match = args[0];
+          const groups = args.slice(1, -2); // last 2 are offset, string
+          // Handle Vim groups \& \0 \1 etc in the replacement
+          let out = jsRep;
+          out = out.replace(/\\&/g, match).replace(/\\0/g, match);
+          for (let g = 1; g <= 9; g++) {
+            const gv = groups[g - 1] || '';
+            out = out.split('\\' + g).join(gv);
+          }
+          out = out.replace(/\\n/g, '\n');
+          return out;
+        };
+
+        let next;
+        if (doGlobal) next = slice.replace(re, replacer);
+        else {
+          // Only first occurrence: create non-global regex
+          const re1 = new RegExp(re.source, re.flags.replace('g', ''));
+          let once = 0;
+          next = slice.replace(re1, function () {
+            once++; count = once;
+            const args = Array.prototype.slice.call(arguments);
+            const match = args[0];
+            const groups = args.slice(1, -2);
+            let out = jsRep;
+            out = out.replace(/\\&/g, match).replace(/\\0/g, match);
+            for (let g = 1; g <= 9; g++) {
+              const gv = groups[g - 1] || '';
+              out = out.split('\\' + g).join(gv);
+            }
+            return out;
+          });
+        }
+
+        if (count === 0) { this._vimMsg('E486: Pattern not found: ' + pat, true); return; }
+
+        // Apply by selecting scope and replacing
+        this.pushChangePosition();
+        this._recordJumpBeforeMove();
+        this.nav.setCaretIndex(scopeStart, false);
+        this.nav.setCaretIndex(scopeEnd, true);
+        this.insertReplacementText(next);
+        const lines = (range === '%' ? ' lines' : '');
+        this._vimMsg(count + ' substitution' + (count === 1 ? '' : 's') + ' on ' + (range === '%' ? 'every' : '1') + ' line' + (count === 1 ? '' : 's'), false);
+        this.setLastChange({ type: 'command', id: 'substitute', count: count });
+      } catch (_) {
+        try { this._vimMsg('E486: Pattern not found', true); } catch (_) {}
+      }
+    }
+
+    lineToIndex(lineNum) {
+      try {
+        const text = this.nav.extractDocumentText();
+        if (!text) return 0;
+        let line = 1;
+        for (let i = 0; i < text.length; i++) {
+          if (line === lineNum) return i;
+          if (text[i] === '\n') line++;
+        }
+        return text.length;
+      } catch (_) { return 0; }
+    }
+
+    exGlobalDelete(pat) {
+      try {
+        const text = this.nav.extractDocumentText();
+        if (!text) return;
+        const re = this.vimPatToRegExp(pat, '');
+        const lines = text.split('\n');
+        let del = 0;
+        for (let i = lines.length - 1; i >= 0; i--) {
+          re.lastIndex = 0;
+          if (re.test(lines[i])) { lines.splice(i, 1); del++; }
+        }
+        if (del === 0) { this._vimMsg('E486: Pattern not found: ' + pat, true); return; }
+        this.pushChangePosition();
+        this.nav.setCaretIndex(0, false);
+        // Select all
+        this.nav.setCaretIndex(text.length, true);
+        this.insertReplacementText(lines.join('\n'));
+        this._vimMsg(del + ' fewer lines', false);
+      } catch (_) {}
+    }
+
+    exSetOption(key, val, bang, amp) {
+      try {
+        // Persist a few options; echo what changed like Vim
+        const boolOpts = { number: false, relativenumber: false, hlsearch: true, ignorecase: false, wrap: true, expandtab: false };
+        if (key in boolOpts) {
+          if (amp) val = boolOpts[key];
+          if (bang) val = !val; // set opt! toggles
+          this._vimOpts = this._vimOpts || {};
+          this._vimOpts[key] = !!val;
+          if (key === 'ignorecase') this._searchIgnoreCase = !!val;
+          if (key === 'hlsearch') { /* no visual hl in Docs; keep flag only */ }
+          const disp = (val ? '' : 'no') + key;
+          this._vimMsg(disp, false);
+          return;
+        }
+        this._vimMsg('E518: Unknown option: ' + key, true);
+      } catch (_) {}
+    }
+
+    exShowRegisters() {
+      try {
+        const keys = Object.keys(this.registers || {});
+        let msg = 'Registers: ';
+        for (let i = 0; i < keys.length && i < 8; i++) {
+          const k = keys[i];
+          const v = this.registers[k];
+          const s = typeof v === 'string' ? v : (v && v.text) || '';
+          const preview = s.length > 20 ? s.slice(0, 20) + '…' : s;
+          msg += '"' + k + ' ' + JSON.stringify(preview) + '  ';
+        }
+        this._vimMsg(msg.trim() || 'No registers', false);
+      } catch (_) {}
+    }
+
+    exShowMarks() {
+      try {
+        const ms = this.marks || {};
+        const keys = Object.keys(ms).filter(k => ms[k] != null);
+        if (!keys.length) { this._vimMsg('No marks set', false); return; }
+        let msg = 'Marks: ';
+        for (let i = 0; i < keys.length; i++) msg += keys[i] + ' ';
+        this._vimMsg(msg, false);
+      } catch (_) {}
+    }
+
+    exShowJumps() {
+      try {
+        const n = (this._jumpList || []).length;
+        this._vimMsg('jumplist: ' + n + ' entries', false);
+      } catch (_) {}
+    }
+
+    exSort(args) {
+      try {
+        const text = this.nav.extractDocumentText();
+        if (!text) return;
+        const lines = text.split('\n');
+        const rev = /\b!/.test(String(args || ''));
+        const ign = /\bi\b/.test(String(args || ''));
+        lines.sort(function (a, b) {
+          const aa = ign ? a.toLowerCase() : a;
+          const bb = ign ? b.toLowerCase() : b;
+          if (aa < bb) return rev ? 1 : -1;
+          if (aa > bb) return rev ? -1 : 1;
+          return 0;
+        });
+        this.pushChangePosition();
+        this.nav.setCaretIndex(0, false);
+        this.nav.setCaretIndex(text.length, true);
+        this.insertReplacementText(lines.join('\n'));
+        this._vimMsg('sorted', false);
+      } catch (_) {}
+    }
+
+    // Search as operator motion: delete/change/yank to match (d/pat, c/pat, y/pat)
+    searchOperatorPending(operator, pat, dir, count, register, forceIgnore) {
+      try {
+        const saved = this._searchIgnoreCaseOverride;
+        if (forceIgnore != null) this._searchIgnoreCaseOverride = forceIgnore;
+        // Find match
+        const text = this.nav.extractDocumentText();
+        const ci = this.nav.caretIndex();
+        if (!text || !ci || ci.index < 0) { this._searchIgnoreCaseOverride = saved; return; }
+        const stash = pat;
+        const savedLast = this._lastSearch;
+        this._searchFindAndMove(stash, dir, count || 1, false);
+        // _searchFindAndMove already moved caret; now apply operator between old pos and new match
+        // For a faithful operator-motion, select from the start to the match.
+        // Vim's d/pat deletes from cursor to start of match; c/pat changes same.
+        // We already moved; so select previous position to current.
+        const newCi = this.nav.caretIndex();
+        if (newCi && ci && newCi.index !== ci.index) {
+          this.nav.setCaretIndex(Math.min(ci.index, newCi.index), false);
+          this.nav.setCaretIndex(Math.max(ci.index, newCi.index), true);
+          this._lastSelType = 'char';
+          this.applyOperator(operator, register);
+          if (operator === 'change') {
+            // applyOperator already entered insert for 'change'
+          }
+        }
+        this._searchIgnoreCaseOverride = saved;
+        try { this.setLastChange({ type: 'operator_search', operator: operator, pat: stash, dir: dir, count: count }); } catch (_) {}
+      } catch (_) {}
+    }
+
+    stub(name) {}
 
     // Expose utilities
     getSelectionInfo() { return getIframeSelection(); }

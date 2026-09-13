@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "settings": {
     "allowRegisterPrefix": true
   },
@@ -21,7 +21,11 @@
     { "keys": ["c","c"], "operator": "change", "target": { "type": "line" } },
     { "keys": [">",">"], "operator": "indent", "target": { "type": "line" } },
     { "keys": ["<","<"], "operator": "dedent", "target": { "type": "line" } },
-    { "keys": ["=","="], "operator": "reindent", "target": { "type": "line" } }
+    { "keys": ["=","="], "operator": "reindent", "target": { "type": "line" } },
+    { "keys": ["g","u","u"], "operator": "lowercase", "target": { "type": "line" } },
+    { "keys": ["g","U","U"], "operator": "uppercase", "target": { "type": "line" } },
+    { "keys": ["g","~","~"], "operator": "toggle_case", "target": { "type": "line" } },
+    { "keys": ["g","w","w"], "operator": "reflow", "target": { "type": "line" } }
   ],
   "motions": [
     { "id": "left",  "keys": ["h"], "acceptsCount": true },
@@ -98,7 +102,6 @@
     { "id": "append_end_line", "keys": ["A"], "modes": ["normal"] },
     { "id": "open_below", "keys": ["o"], "modes": ["normal"], "acceptsCount": true },
     { "id": "open_above", "keys": ["O"], "modes": ["normal"], "acceptsCount": true },
-    { "id": "append_end_word", "keys": ["e","a"], "modes": ["normal"] },
     { "id": "replace_char", "keys": ["r","<char>"], "modes": ["normal"], "args": [{"name":"char","type":"char"}], "acceptsCount": true },
     { "id": "replace_mode", "keys": ["R"], "modes": ["normal"] },
     { "id": "join_lines", "keys": ["J"], "modes": ["normal"], "acceptsCount": true },
@@ -129,6 +132,10 @@
     { "id": "visual_indent", "keys": [">"] , "modes": ["visual", "visualLine"] },
     { "id": "visual_dedent", "keys": ["<"], "modes": ["visual", "visualLine"] },
     { "id": "visual_toggle_case", "keys": ["~"], "modes": ["visual", "visualLine"] },
+    { "id": "visual_paste", "keys": ["p"], "modes": ["visual", "visualLine"] },
+    { "id": "visual_paste_before", "keys": ["P"], "modes": ["visual", "visualLine"] },
+    { "id": "visual_delete_char", "keys": ["x"], "modes": ["visual", "visualLine"] },
+    { "id": "visual_substitute", "keys": ["s"], "modes": ["visual", "visualLine"] },
     { "id": "visual_lowercase", "keys": ["u"], "modes": ["visual", "visualLine"] },
     { "id": "visual_uppercase", "keys": ["U"], "modes": ["visual", "visualLine"] },
     { "id": "exit_visual", "keys": ["<ESC>"], "modes": ["visual", "visualLine"] },
