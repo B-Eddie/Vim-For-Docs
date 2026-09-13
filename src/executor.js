@@ -59,10 +59,31 @@
     return event;
   }
 
+  // Perf: cache iframe + editor element; Docs rarely recreates the iframe.
+  let _execIframe = null;
+  let _execIframeAt = 0;
+  let _execEditEl = null;
+  let _execEditElDoc = null;
+  const EXEC_IFRAME_TTL = 2000;
+  function getExecIframe() {
+    const now = Date.now();
+    if (_execIframe && _execIframe.isConnected && (now - _execIframeAt) < EXEC_IFRAME_TTL) return _execIframe;
+    try {
+      const el = document.querySelector('.docs-texteventtarget-iframe');
+      if (el) { _execIframe = el; _execIframeAt = now; return el; }
+    } catch (_) {}
+    _execIframe = null;
+    return null;
+  }
   function findEditorElement() {
-    const editorIframe = document.querySelector('.docs-texteventtarget-iframe');
+    const editorIframe = getExecIframe();
     if (editorIframe && editorIframe.contentDocument) {
-      return editorIframe.contentDocument.activeElement || editorIframe.contentDocument.body;
+      const idoc = editorIframe.contentDocument;
+      if (_execEditElDoc === idoc && _execEditEl && _execEditEl.isConnected) return _execEditEl;
+      const el = idoc.activeElement || idoc.body;
+      _execEditEl = el;
+      _execEditElDoc = idoc;
+      return el;
     }
     const iframe = document.getElementsByTagName('iframe')[0];
     if (iframe && iframe.contentDocument) {
@@ -120,13 +141,19 @@
   }
 
   function focusEditor() {
-    const editorIframe = document.querySelector('.docs-texteventtarget-iframe');
+    const editorIframe = getExecIframe();
     const editorWindow = editorIframe?.contentWindow;
     const editorDocument = editorWindow?.document;
     if (editorWindow && editorDocument) {
-      if (typeof editorWindow.focus === 'function') editorWindow.focus();
+      if (typeof editorWindow.focus === 'function') try { editorWindow.focus(); } catch (_) {}
+      if (_execEditElDoc === editorDocument && _execEditEl && _execEditEl.isConnected) {
+        try { _execEditEl.focus({ preventScroll: true }); } catch (_) { try { _execEditEl.focus(); } catch (_) {} }
+        return;
+      }
       const editorRoot = editorDocument.querySelector('[contenteditable="true"]') || editorDocument.body;
-      editorRoot?.focus();
+      _execEditEl = editorRoot;
+      _execEditElDoc = editorDocument;
+      try { editorRoot?.focus({ preventScroll: true }); } catch (_) { try { editorRoot?.focus(); } catch (_) {} }
     }
   }
 
@@ -248,22 +275,57 @@
     return s?.text || '';
   }
 
+  // Perf: cache Docs scroll container (re-validated by isConnected).
+  let _scrollContainer = null;
+  function getDocsScrollContainer() {
+    if (_scrollContainer && _scrollContainer.isConnected &&
+        _scrollContainer.scrollHeight > _scrollContainer.clientHeight) return _scrollContainer;
+    try {
+      const el = document.querySelector('.kix-appview-editor, .kix-appview, .kix-zoomdocumentplugin-outer');
+      if (el) { _scrollContainer = el; return el; }
+    } catch (_) {}
+    return null;
+  }
+  // Coalesce zt/zz/zb scrolls: only the last one in a burst runs.
+  let _scrollRaf = 0;
+  let _pendingScrollPos = null;
   function scrollSelectionIntoView(position /* 'top' | 'center' | 'bottom' */) {
+    _pendingScrollPos = position;
+    if (_scrollRaf) return;
+    try {
+      _scrollRaf = requestAnimationFrame(function () {
+        _scrollRaf = 0;
+        const pos = _pendingScrollPos;
+        _pendingScrollPos = null;
+        try { scrollSelectionIntoViewNow(pos); } catch (_) {}
+      });
+    } catch (_) {
+      const pos = _pendingScrollPos; _pendingScrollPos = null; _scrollRaf = 0;
+      try { scrollSelectionIntoViewNow(pos); } catch (_) {}
+    }
+  }
+  function scrollSelectionIntoViewNow(position) {
     try {
       const desiredOffset = (rect, viewportH) => {
         return position === 'top' ? 20 : (position === 'bottom' ? Math.max(viewportH - rect.height - 20, 0) : Math.max((viewportH - rect.height) / 2, 0));
       };
 
       const getScrollParent = (el) => {
+        // Fast path: cached Docs container covers 99% of cases.
+        const cached = getDocsScrollContainer();
+        if (cached) return cached;
         let node = el;
-        while (node && node !== document.body) {
-          const cs = window.getComputedStyle(node);
+        let depth = 0;
+        while (node && node !== document.body && depth < 6) {
+          depth++;
+          let cs = null;
+          try { cs = window.getComputedStyle(node); } catch (_) { node = node.parentElement; continue; }
           const oy = cs && cs.overflowY;
           const isScrollable = oy === 'auto' || oy === 'scroll' || oy === 'overlay';
           if (isScrollable && node.scrollHeight > node.clientHeight) return node;
           node = node.parentElement;
         }
-        return null;
+        return cached;
       };
 
       const scrollWithin = (container, targetRect) => {
@@ -282,22 +344,19 @@
         if (rect && Number.isFinite(rect.top)) {
           const sp = getScrollParent(caret.parentElement || caret);
           if (sp) { scrollWithin(sp, rect); return; }
-          // Try known Docs containers as fallback
-          const candidates = document.querySelectorAll('.kix-appview-editor, .kix-appview, .kix-zoomdocumentplugin-outer');
-          for (const c of candidates) {
-            if (c && c.scrollHeight > c.clientHeight) { scrollWithin(c, rect); return; }
-          }
-          // Last resort: window scroll
+          // Last resort: window scroll (cached container already tried in getScrollParent)
           const viewH = window.innerHeight || document.documentElement.clientHeight || 0;
           const desiredTop = desiredOffset(rect, viewH);
           const delta = rect.top - desiredTop;
+          // Skip tiny scrolls that cause jitter.
+          if (Math.abs(delta) < 2) return;
           window.scrollTo({ top: (window.scrollY || document.documentElement.scrollTop || 0) + delta, behavior: 'auto' });
           return;
         }
       }
 
       // 2) Fallback to selection inside the event-target iframe
-      const iframe = document.querySelector('.docs-texteventtarget-iframe');
+      const iframe = getExecIframe();
       const win = iframe && iframe.contentWindow;
       if (!win) return;
       const sel = win.getSelection();
@@ -310,7 +369,7 @@
         top: rect.top + iframeRect.top,
         height: rect.height
       };
-      const scrollContainer = document.querySelector('.kix-appview-editor, .kix-appview, .kix-zoomdocumentplugin-outer');
+      const scrollContainer = getDocsScrollContainer();
       if (scrollContainer) {
         const cRect = scrollContainer.getBoundingClientRect();
         const viewH = scrollContainer.clientHeight || (window.innerHeight || 0);
@@ -361,9 +420,11 @@
   class GDocsNavigator {
     constructor() {
       this.MAX_SCAN = 2048;
+      this._rootCache = null; // {root,doc,win,at}
+      this._textCache = null; // {text,at,root}
     }
     getSelAndRange() {
-      const iframe = document.querySelector('.docs-texteventtarget-iframe');
+      const iframe = getExecIframe();
       if (!iframe) return { sel: null, range: null };
       try {
         const sel = iframe.contentWindow.getSelection();
@@ -372,6 +433,7 @@
         return { sel, range };
       } catch (e) { return { sel: null, range: null }; }
     }
+    invalidateCaches() { this._rootCache = null; this._textCache = null; }
     isWhitespace(ch) { return !ch || /\s/.test(ch); }
     isNewline(ch) { return ch === '\n'; }
     isWordChar(ch) { return /[A-Za-z0-9_]/.test(ch || ''); }
@@ -960,9 +1022,14 @@
       };
     }
 
-    // Return editor root inside the event-target iframe
+    // Return editor root inside the event-target iframe (cached 2s)
     getEditorRoot() {
-      const iframe = document.querySelector('.docs-texteventtarget-iframe');
+      const now = Date.now();
+      if (this._rootCache && this._rootCache.root && this._rootCache.root.isConnected &&
+          (now - this._rootCache.at) < 2000) {
+        return this._rootCache;
+      }
+      const iframe = getExecIframe();
       if (!iframe) return { root: null, doc: null, win: null };
       const editorDoc = iframe.contentDocument;
       if (!editorDoc) return { root: null, doc: null, win: null };
@@ -973,28 +1040,42 @@
         "[contenteditable='true']"
       ];
       let editorRoot = null;
-      for (const selector of editorSelectors) { editorRoot = editorDoc.querySelector(selector); if (editorRoot) break; }
+      for (const selector of editorSelectors) {
+        try { editorRoot = editorDoc.querySelector(selector); } catch (_) { editorRoot = null; }
+        if (editorRoot) break;
+      }
       if (!editorRoot) editorRoot = editorDoc.body;
-      return { root: editorRoot, doc: editorDoc, win: iframe.contentWindow };
+      this._rootCache = { root: editorRoot, doc: editorDoc, win: iframe.contentWindow, at: now };
+      return this._rootCache;
     }
 
     extractDocumentText() {
+      const now = Date.now();
       const { root } = this.getEditorRoot();
       if (!root) return '';
+      if (this._textCache && this._textCache.root === root && (now - this._textCache.at) < 300) {
+        return this._textCache.text;
+      }
       const blockLevelTags = new Set(['P', 'DIV', 'LI', 'TABLE', 'TR', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
-      let text = '';
+      const parts = [];
       const visit = (node) => {
         if (node.nodeType === Node.TEXT_NODE) {
-          text += node.nodeValue || '';
+          if (node.nodeValue) parts.push(node.nodeValue);
         } else if (node.nodeType === Node.ELEMENT_NODE) {
-          if (node.tagName === 'BR') { text += '\n'; }
+          if (node.tagName === 'BR') { parts.push('\n'); }
           else {
             for (let child = node.firstChild; child; child = child.nextSibling) visit(child);
-            if (blockLevelTags.has(node.tagName) && !text.endsWith('\n')) { text += '\n'; }
+            if (blockLevelTags.has(node.tagName)) {
+              // Avoid trailing '\n' check on huge joined string: track last part.
+              const last = parts.length ? parts[parts.length - 1] : '';
+              if (!last || !last.endsWith('\n')) parts.push('\n');
+            }
           }
         }
       };
       visit(root);
+      const text = parts.join('');
+      this._textCache = { text, at: now, root };
       return text;
     }
     // Compute a path of child indices from editor root to the selection focus node, with its offset
@@ -1154,47 +1235,44 @@
       let done = false;
       let timer = null;
       let mo = null;
+      let mo2 = null;
       let selDoc = null;
       const finish = () => {
         if (done) return; done = true;
         try { if (selDoc) selDoc.removeEventListener('selectionchange', finish); } catch (_) {}
         try { if (mo) mo.disconnect(); } catch (_) {}
+        try { if (mo2) mo2.disconnect(); } catch (_) {}
+        mo = null; mo2 = null; selDoc = null;
         try { if (timer) clearTimeout(timer); } catch (_) {}
         resolve();
       };
       try {
-        const iframe = document.querySelector('.docs-texteventtarget-iframe');
+        const iframe = getExecIframe();
         const idoc = iframe && iframe.contentDocument;
         if (idoc) {
           selDoc = idoc;
-          idoc.addEventListener('selectionchange', finish, { once: true });
+          try { idoc.addEventListener('selectionchange', finish, { once: true }); } catch (_) {
+            try { idoc.addEventListener('selectionchange', finish); } catch (_) {}
+          }
           if (observeMutations) {
-            const target = idoc.querySelector('[contenteditable="true"]') || idoc.body;
+            const target = (_execEditElDoc === idoc && _execEditEl && _execEditEl.isConnected)
+              ? _execEditEl
+              : (idoc.querySelector('[contenteditable="true"]') || idoc.body);
             if (target) {
               mo = new MutationObserver(finish);
-              mo.observe(target, { childList: true, subtree: true, characterData: true });
+              // characterData:false + subtree depth limited by target choice;
+              // selectionchange already catches caret moves.
+              mo.observe(target, { childList: true, subtree: true, characterData: false });
             }
           }
         }
         // Also observe the visible Docs surface for content mutations (Docs renders
         // text into the main document, not the input iframe).
         if (observeMutations) {
-          const editorSurface = document.querySelector('.kix-appview-editor-container')
-            || document.querySelector('.kix-appview-editor')
-            || document.body;
+          const editorSurface = getDocsScrollContainer() || document.body;
           if (editorSurface) {
-            const mo2 = new MutationObserver(finish);
-            mo2.observe(editorSurface, { childList: true, subtree: true, characterData: true });
-            // Tie its lifetime to the main observer
-            const origFinish = finish;
-            // Wrap finish to also disconnect mo2 (idempotent via 'done' flag)
-            const realFinish = () => { try { mo2.disconnect(); } catch (_) {} origFinish(); };
-            // Reassign timer/listeners to use realFinish - but we already attached origFinish.
-            // Simpler: schedule a tick to ensure cleanup on resolve.
-            const cleanup = () => { try { mo2.disconnect(); } catch (_) {} };
-            // Patch resolve to clean up mo2:
-            const _resolve = resolve;
-            resolve = (v) => { cleanup(); _resolve(v); };
+            mo2 = new MutationObserver(finish);
+            mo2.observe(editorSurface, { childList: true, subtree: false, characterData: false });
           }
         }
       } catch (_) {}

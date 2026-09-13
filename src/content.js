@@ -539,25 +539,54 @@
     return named[e.key] || null;
   }
 
+  // Perf: cache iframe lookup (Docs recreates it rarely; re-validate by isConnected).
+  let _cachedIframe = null;
+  let _cachedIframeAt = 0;
+  const IFRAME_CACHE_TTL = 2000;
+  function getEditorIframe() {
+    const now = Date.now();
+    if (_cachedIframe && _cachedIframe.isConnected && (now - _cachedIframeAt) < IFRAME_CACHE_TTL) {
+      return _cachedIframe;
+    }
+    try {
+      const el = document.querySelector('.docs-texteventtarget-iframe');
+      if (el) { _cachedIframe = el; _cachedIframeAt = now; return el; }
+    } catch (_) {}
+    _cachedIframe = null;
+    return null;
+  }
+
   function findEditorDoc() {
-    const editorIframe = document.querySelector('.docs-texteventtarget-iframe');
+    const editorIframe = getEditorIframe();
     if (editorIframe && editorIframe.contentDocument) return editorIframe.contentDocument;
     const anyIframe = document.getElementsByTagName('iframe')[0];
     if (anyIframe && anyIframe.contentDocument) return anyIframe.contentDocument;
     return document;
   }
 
+  // Perf: cache contenteditable root per iframe document.
+  let _cachedEditRoot = null;
+  let _cachedEditRootDoc = null;
   function focusEditorQuick() {
     try {
-      const iframe = document.querySelector('.docs-texteventtarget-iframe');
+      const iframe = getEditorIframe();
       const win = iframe && iframe.contentWindow;
       const doc = win && win.document;
       if (win && typeof win.focus === 'function') try { win.focus(); } catch (_) {}
       if (doc) {
-        const root = doc.querySelector('[contenteditable="true"]') || doc.body || doc.documentElement;
-        try { root && root.focus && root.focus(); } catch (_) {}
+        let root = null;
+        if (_cachedEditRootDoc === doc && _cachedEditRoot && _cachedEditRoot.isConnected) {
+          root = _cachedEditRoot;
+        } else {
+          root = doc.querySelector('[contenteditable="true"]') || doc.body || doc.documentElement;
+          _cachedEditRoot = root;
+          _cachedEditRootDoc = doc;
+        }
+        try { root && root.focus && root.focus({ preventScroll: true }); } catch (_) {
+          try { root && root.focus && root.focus(); } catch (_) {}
+        }
       }
-      try { window.focus(); } catch (_) {}
+      // Don't steal window focus on every keystroke; iframe focus is enough.
     } catch (_) {}
   }
 
@@ -726,7 +755,7 @@
             setMode('normal'); replaceMode = false;
             try { if (ui && ui.setReplaceMode) ui.setReplaceMode(false); } catch (_) {}
             try { focusEditorQuick(); } catch (_) {}
-            try { if (ui) { setTimeout(function () { ui.updateCursorStyle(); }, 0); setTimeout(function () { ui.updateCursorStyle(); }, 60); setTimeout(function () { ui.updateCursorStyle(); }, 250); } } catch (_) {}
+            try { if (ui) { if (ui.requestCursorUpdate) ui.requestCursorUpdate(); else ui.updateCursorStyle(); } } catch (_) {}
             return;
           }
           if (token === '<C-O>') {
@@ -791,14 +820,14 @@
             setMode('normal'); replaceMode = false;
             try { if (ui && ui.setReplaceMode) ui.setReplaceMode(false); } catch (_) {}
             try { focusEditorQuick(); } catch (_) {}
-            try { if (ui) { setTimeout(function () { ui.updateCursorStyle(); }, 0); setTimeout(function () { ui.updateCursorStyle(); }, 60); } } catch (_) {}
+            try { if (ui) { if (ui.requestCursorUpdate) ui.requestCursorUpdate(); else ui.updateCursorStyle(); } } catch (_) {}
             return;
           }
           tempNormal = false;
           try { if (ui && ui.setReplaceMode) ui.setReplaceMode(false); } catch (_) {}
           runExec({ kind: 'command', command: { id: 'exit_mode' }, count: 1 });
           try { focusEditorQuick(); } catch (_) {}
-          try { if (ui) { setTimeout(function () { ui.updateCursorStyle(); }, 0); setTimeout(function () { ui.updateCursorStyle(); }, 60); } } catch (_) {}
+          try { if (ui) { if (ui.requestCursorUpdate) ui.requestCursorUpdate(); else ui.updateCursorStyle(); } } catch (_) {}
           return;
         }
 
@@ -845,18 +874,39 @@
       if (iframe && iframe.contentWindow) try { iframe.contentWindow.addEventListener('keydown', handleKeydown, true); } catch (_) {}
     } catch (_) {}
     try {
-      const obs = new MutationObserver(() => {
+      // Perf: Docs mutates constantly (canvas tiles). Debounce re-attach and
+      // bail out fast when everything is already attached.
+      let reattachTimer = 0;
+      const doReattach = () => {
+        reattachTimer = 0;
         try { attachToDoc(findEditorDoc()); } catch (_) {}
         try {
-          const ifr = document.querySelector('.docs-texteventtarget-iframe');
-          if (ifr && ifr.contentDocument) attachToDoc(ifr.contentDocument);
-          if (ifr && ifr.contentWindow && !ifr.contentWindow.__vimKeyAttachedWin) {
+          const ifr = getEditorIframe();
+          if (!ifr) return;
+          if (ifr.contentDocument) attachToDoc(ifr.contentDocument);
+          if (ifr.contentWindow && !ifr.contentWindow.__vimKeyAttachedWin) {
             ifr.contentWindow.__vimKeyAttachedWin = true;
             ifr.contentWindow.addEventListener('keydown', handleKeydown, true);
           }
         } catch (_) {}
+      };
+      const obs = new MutationObserver(() => {
+        // Fast path: if iframe cached + attached, skip scheduling.
+        try {
+          const ifr = _cachedIframe;
+          if (ifr && ifr.isConnected && ifr.contentDocument && ifr.contentDocument.__vimKeyAttached &&
+              (!ifr.contentWindow || ifr.contentWindow.__vimKeyAttachedWin)) {
+            return;
+          }
+        } catch (_) {}
+        if (reattachTimer) return;
+        reattachTimer = setTimeout(doReattach, 500);
       });
+      // Keep subtree:true so late iframe inserts are seen; callback itself
+      // is cheap (cached fast-path + 500ms debounce).
       obs.observe(document.documentElement, { childList: true, subtree: true });
+      // One delayed check for late iframe creation; observer handles the rest.
+      setTimeout(doReattach, 1500);
     } catch (_) {}
   }
 

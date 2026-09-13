@@ -16,10 +16,29 @@
       this.cmdline = null; // { type: ':'|'/'|'?', text: '', pos: 0 }
       this.message = null; // { text, isError, timer }
       this.ind = null;
+      this._barLeft = null;
+      this._barRight = null;
       this._msgTimer = null;
       this._cmdCursorBlink = null;
+      // Perf: coalesce cursor style work + cache caret measurements.
+      this._cursorRaf = 0;
+      this._lastCursorMode = null;
+      this._lastCaretH = 0;
+      this._lastCaretHAt = 0;
       this.ensureIndicator();
       this.applyTheme();
+    }
+
+    _cacheBarEls() {
+      try {
+        if (!this.ind) return;
+        if (!this._barLeft || !this._barLeft.isConnected) {
+          this._barLeft = this.ind.querySelector('.vim-bar-left');
+        }
+        if (!this._barRight || !this._barRight.isConnected) {
+          this._barRight = this.ind.querySelector('.vim-bar-right');
+        }
+      } catch (_) {}
     }
 
     ensureIndicator() {
@@ -33,6 +52,7 @@
       try { document.body.appendChild(this.ind); } catch (_) {
         try { document.documentElement.appendChild(this.ind); } catch (_) {}
       }
+      try { this._cacheBarEls(); } catch (_) {}
       try { this._injectCursorStyle(); } catch (_) {}
       try { this._ensureCaretObserver(); } catch (_) {}
     }
@@ -150,9 +170,12 @@
       if (!this.ind.querySelector('.vim-bar-left')) {
         this.ind.innerHTML =
           '<div class="vim-bar-left"></div><div class="vim-bar-right"></div>';
+        this._barLeft = null;
+        this._barRight = null;
       }
-      var left = this.ind.querySelector('.vim-bar-left');
-      var right = this.ind.querySelector('.vim-bar-right');
+      this._cacheBarEls();
+      var left = this._barLeft;
+      var right = this._barRight;
 
       if (this.theme === 'vim') {
         // True Vim: bottom line, dark terminal background, light text,
@@ -247,14 +270,19 @@
 
     render() {
       if (!this.ind) return;
-      var left = this.ind.querySelector('.vim-bar-left');
-      var right = this.ind.querySelector('.vim-bar-right');
+      this._cacheBarEls();
+      var left = this._barLeft;
+      var right = this._barRight;
       if (!left || !right) {
         this.ind.innerHTML =
           '<div class="vim-bar-left"></div><div class="vim-bar-right"></div>';
-        left = this.ind.querySelector('.vim-bar-left');
-        right = this.ind.querySelector('.vim-bar-right');
+        this._barLeft = null;
+        this._barRight = null;
+        this._cacheBarEls();
+        left = this._barLeft;
+        right = this._barRight;
       }
+      if (!left || !right) return;
 
       if (this.theme !== 'vim') {
         // Default floating pill: keep it minimal and compatible with old theme
@@ -347,6 +375,20 @@
       right.style.color = '#a89984';
     }
 
+    // Coalesced entry point: rapid mode/selection events become one rAF.
+    requestCursorUpdate() {
+      if (this._cursorRaf) return;
+      var self = this;
+      try {
+        this._cursorRaf = requestAnimationFrame(function () {
+          self._cursorRaf = 0;
+          try { self.updateCursorStyle(); } catch (_) {}
+        });
+      } catch (_) {
+        try { self.updateCursorStyle(); } catch (_) {}
+      }
+    }
+
     // ----- Block cursor (kept from previous impl, tweaked) -----
     updateCursorStyle() {
       var isInsert = false;
@@ -356,8 +398,17 @@
         // typing ":". We map cmdline -> normal cursor here for consistency.
         isInsert = (this.cmdline ? false : (this.modeText === 'insert' && !this._replaceMode));
       } catch (_) { isInsert = (this.modeText === 'insert'); }
-      var caret = document.querySelector('.kix-cursor-caret');
-      var wrapper = document.querySelector('.kix-cursor');
+      var modeKey = (this.cmdline ? 'command' : this.modeText) + (isInsert ? ':i' : ':n');
+      // Skip redundant block-cursor recompute (measurement needs layout).
+      // Always re-apply in non-insert (Docs recreates caret), but avoid
+      // getComputedStyle chain when we just measured a good height.
+      var now = Date.now();
+      var caret = null;
+      var wrapper = null;
+      try {
+        caret = document.querySelector('.kix-cursor-caret');
+        wrapper = document.querySelector('.kix-cursor');
+      } catch (_) {}
       if (!caret) {
         if (wrapper && !isInsert) {
           try {
@@ -403,15 +454,20 @@
       }
       var h = 0;
       try { h = parseFloat((caret.style.height || '').slice(0, -2)); } catch (_) {}
-      if (!h || isNaN(h) || h <= 0) { try { h = parseFloat(getComputedStyle(caret).height); } catch (_) {} }
+      // Reuse recent good measurement: caret height rarely changes per doc.
+      if ((!h || isNaN(h) || h <= 0) && this._lastCaretH > 0 && (now - this._lastCaretHAt) < 5000) {
+        h = this._lastCaretH;
+      }
       if (!h || isNaN(h) || h <= 0) { try { h = caret.getBoundingClientRect().height; } catch (_) {} }
       if (!h || isNaN(h) || h <= 0) { try { h = caret.offsetHeight; } catch (_) {} }
+      if (!h || isNaN(h) || h <= 0) { try { h = parseFloat(getComputedStyle(caret).height); } catch (_) {} }
       if (!h || isNaN(h) || h <= 0) {
         try {
           var wh = wrapper ? parseFloat(getComputedStyle(wrapper).height) : 0;
           if (wh && !isNaN(wh) && wh > 0) h = wh;
         } catch (_) {}
       }
+      if (h && !isNaN(h) && h > 0) { this._lastCaretH = h; this._lastCaretHAt = now; }
       var usedFallbackH = false;
       if (!h || isNaN(h) || h <= 0) {
         try {
@@ -509,7 +565,14 @@
       if (this._caretObserver) return;
       try {
         var self = this;
-        var apply = function () { self.updateCursorStyle(); };
+        var apply = function () { self.requestCursorUpdate(); };
+        var lastApply = 0;
+        var debouncedApply = function () {
+          var n = Date.now();
+          if (n - lastApply < 100) return; // coalesce bursts
+          lastApply = n;
+          apply();
+        };
         this._caretObserver = new MutationObserver(function (mutations) {
           var touched = false;
           for (var i = 0; i < mutations.length; i++) {
@@ -529,13 +592,7 @@
               touched = true; break;
             }
           }
-          if (touched) {
-            try { requestAnimationFrame(apply); } catch (_) { setTimeout(apply, 0); }
-            setTimeout(apply, 0);
-            setTimeout(apply, 60);
-            setTimeout(apply, 200);
-            setTimeout(apply, 500);
-          }
+          if (touched) debouncedApply();
         });
         this._caretObserver.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
       } catch (_) {}
@@ -543,24 +600,29 @@
         var self2 = this;
         var doApply = function () {
           if (self2.modeText !== 'insert' || self2.cmdline) {
-            try { requestAnimationFrame(function () { self2.updateCursorStyle(); }); } catch (_) { setTimeout(function () { self2.updateCursorStyle(); }, 0); }
-            setTimeout(function () { try { self2.updateCursorStyle(); } catch (_) {} }, 60);
+            self2.requestCursorUpdate();
           }
         };
-        document.addEventListener('selectionchange', doApply);
+        document.addEventListener('selectionchange', doApply, { passive: true });
         var attachIframe = function () {
           try {
             var iframe = document.querySelector('.docs-texteventtarget-iframe');
             var idoc = iframe && iframe.contentDocument;
             if (idoc && !idoc.__vimSelAttached) {
               idoc.__vimSelAttached = true;
-              idoc.addEventListener('selectionchange', doApply);
+              idoc.addEventListener('selectionchange', doApply, { passive: true });
             }
           } catch (_) {}
         };
         attachIframe();
         try {
-          var ivObs = new MutationObserver(function () { attachIframe(); try { self2.updateCursorStyle(); } catch (_) {} });
+          var lastIv = 0;
+          var ivObs = new MutationObserver(function () {
+            var n = Date.now();
+            if (n - lastIv < 1000) return;
+            lastIv = n;
+            attachIframe();
+          });
           ivObs.observe(document.documentElement, { childList: true, subtree: true });
         } catch (_) {}
       } catch (_) {}

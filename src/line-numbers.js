@@ -25,6 +25,16 @@
     let initialized = false;
     let eventListenersAdded = false;
     let observers = [];
+    // Perf: coalesce rapid updates (keydown/scroll/mutations) into one rAF,
+    // skip work when caret hasn't moved, and track created markers so clear
+    // doesn't need a document-wide querySelectorAll each time.
+    let pendingRaf = 0;
+    let pendingTimer = 0;
+    let lastRun = 0;
+    let lastCaretTop = -1;
+    let lastCaretLeft = -1;
+    let activeMarkers = [];
+    const UPDATE_MIN_INTERVAL = 80;
     
     // Pool for reusing marker elements
     const markersPool = [];
@@ -60,8 +70,19 @@
         document.head.appendChild(styleEl);
     }
     
-    // Remove all existing markers
+    // Remove all existing markers (tracked list first, DOM query as fallback)
     function clearMarkers() {
+        if (activeMarkers.length) {
+            for (let i = 0; i < activeMarkers.length; i++) {
+                const marker = activeMarkers[i];
+                try { marker.remove(); } catch (_) {}
+                if (markersPool.length < 100) {
+                    markersPool.push(marker);
+                }
+            }
+            activeMarkers = [];
+            return;
+        }
         const markers = document.querySelectorAll(`.${config.markerClass}`);
         markers.forEach(marker => {
             marker.remove();
@@ -100,15 +121,45 @@
     // Add markers to the document
     function addMarkers(markers) {
         if (!enabled) return; // Extra check before adding markers
-        
+
         const fragment = document.createDocumentFragment();
-        markers.forEach(marker => {
-            if (marker) fragment.appendChild(marker);
-        });
+        for (let i = 0; i < markers.length; i++) {
+            const marker = markers[i];
+            if (marker) { fragment.appendChild(marker); activeMarkers.push(marker); }
+        }
         document.body.appendChild(fragment);
     }
-    
-    // Update relative line number markers (instant updates, no throttling)
+
+    // Coalesced scheduler: rapid key/scroll/mutation events become one update.
+    function scheduleLineUpdate() {
+        if (!enabled) { clearMarkers(); return; }
+        const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        if (now - lastRun < UPDATE_MIN_INTERVAL) {
+            if (pendingTimer) return;
+            const wait = UPDATE_MIN_INTERVAL - (now - lastRun);
+            pendingTimer = setTimeout(function () {
+                pendingTimer = 0;
+                lastRun = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                try { updateLineMarkers(); } catch (_) {}
+            }, wait);
+            return;
+        }
+        try {
+            if (typeof requestAnimationFrame === 'function') {
+                if (pendingRaf) return;
+                pendingRaf = requestAnimationFrame(function () {
+                    pendingRaf = 0;
+                    lastRun = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                    try { updateLineMarkers(); } catch (_) {}
+                });
+            } else {
+                lastRun = now;
+                updateLineMarkers();
+            }
+        } catch (_) { updateLineMarkers(); }
+    }
+
+    // Update relative line number markers (throttled via scheduleLineUpdate)
     function updateLineMarkers() {
         if (!enabled) { clearMarkers(); return; }
         try {
@@ -118,6 +169,12 @@
             if (caretRect.width === 0 && caretRect.height === 0) return;
 
             const caretTopDoc = caretRect.top + window.scrollY;
+            // Skip rebuild when caret hasn't moved (e.g. repeated mutations).
+            if (Math.abs(caretTopDoc - lastCaretTop) < 2 && Math.abs(caretRect.left - lastCaretLeft) < 2 && activeMarkers.length) {
+                return;
+            }
+            lastCaretTop = caretTopDoc;
+            lastCaretLeft = caretRect.left;
             lastCaretRect = { ...caretRect };
 
             // Clear existing markers
@@ -171,27 +228,34 @@
     }
 
     function getLineTopsNear(centerYDoc) {
-        const selectors = [
+        // Perf: try cheapest selector first; only fall through if empty.
+        // Cap scanned nodes so huge docs don't force hundreds of layouts.
+        const selectorPriority = [
             '.kix-lineview-content',
             '.kix-lineview',
-            '.kix-paragraphrenderer',
-            '.kix-paragraphrenderer *[style*="position: absolute"]'
+            '.kix-paragraphrenderer'
         ];
         const seen = new Set();
         const tops = [];
         const viewMin = window.scrollY - window.innerHeight * 0.5;
         const viewMax = window.scrollY + window.innerHeight * 1.5;
-        selectors.forEach(sel => {
-            const els = document.querySelectorAll(sel);
-            els.forEach(el => {
-                const r = el.getBoundingClientRect();
-                if (!r || r.height === 0 && r.width === 0) return;
+        const MAX_NODES = 400;
+        for (let s = 0; s < selectorPriority.length; s++) {
+            const els = document.querySelectorAll(selectorPriority[s]);
+            if (!els || !els.length) continue;
+            const n = Math.min(els.length, MAX_NODES);
+            for (let i = 0; i < n; i++) {
+                const el = els[i];
+                let r;
+                try { r = el.getBoundingClientRect(); } catch (_) { continue; }
+                if (!r || (r.height === 0 && r.width === 0)) continue;
                 const top = Math.round(r.top + window.scrollY);
-                if (top < viewMin || top > viewMax) return;
+                if (top < viewMin || top > viewMax) continue;
                 const key = String(top);
                 if (!seen.has(key)) { seen.add(key); tops.push(top); }
-            });
-        });
+            }
+            if (tops.length >= 10) break; // enough to anchor relative numbers
+        }
         tops.sort((a,b)=>a-b);
         return tops;
     }
@@ -212,12 +276,12 @@
         return false;
     }
     
-    // Handle scroll events (instant updates)
+    // Handle scroll events (coalesced)
     function handleScroll() {
         if (!enabled) return;
-        updateLineMarkers();
+        scheduleLineUpdate();
     }
-    
+
     // Set up mutation observer to watch for caret changes
     function observeCaretChanges() {
         const caret = document.querySelector(config.caretSelector);
@@ -227,9 +291,9 @@
             }
             return null;
         }
-        
+
         const observer = new MutationObserver(() => {
-            if (enabled) updateLineMarkers();
+            if (enabled) scheduleLineUpdate();
         });
         
         observer.observe(caret, { 
@@ -253,7 +317,7 @@
         
         const observer = new MutationObserver(() => {
             if (enabled) {
-                updateLineMarkers(true);
+                scheduleLineUpdate();
             }
         });
         
@@ -272,21 +336,21 @@
         if (eventListenersAdded) return;
         
         document.addEventListener("keyup", () => {
-            if (enabled) updateLineMarkers();
+            if (enabled) scheduleLineUpdate();
         }, { passive: true });
-        
+
         document.addEventListener("keydown", () => {
-            if (enabled) updateLineMarkers();
+            if (enabled) scheduleLineUpdate();
         }, { passive: true });
-        
+
         document.addEventListener("mouseup", () => {
-            if (enabled) updateLineMarkers();
+            if (enabled) scheduleLineUpdate();
         }, { passive: true });
-        
+
         // Add scroll listeners
-        document.addEventListener("scroll", handleScroll, { passive: true });
+        document.addEventListener("scroll", handleScroll, { passive: true, capture: true });
         window.addEventListener("resize", () => {
-            if (enabled) updateLineMarkers(true);
+            if (enabled) { lastCaretTop = -1; scheduleLineUpdate(); }
         }, { passive: true });
         
         // Add scroll listener to the editor container
@@ -325,12 +389,17 @@
     function toggleLineNumbers(showLineNumbers) {
         const wasEnabled = enabled;
         enabled = showLineNumbers;
-        
+        lastCaretTop = -1;
+        lastCaretLeft = -1;
+
         // If turning off, make sure markers are cleared
         if (!enabled) {
+            try { if (pendingRaf && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(pendingRaf); } catch (_) {}
+            try { if (pendingTimer) clearTimeout(pendingTimer); } catch (_) {}
+            pendingRaf = 0; pendingTimer = 0;
             clearMarkers();
         }
-        
+
         // If turning on from off
         if (enabled && !wasEnabled) {
             if (!initialized) {
@@ -338,10 +407,10 @@
             } else {
                 addEventListeners();
                 setupObservers();
-                updateLineMarkers(true);
+                scheduleLineUpdate();
             }
         }
-        
+
         return enabled;
     }
 
@@ -419,9 +488,10 @@
         }
     }
     
-    // Expose API to window
+    // Expose API to window (update is throttled; updateNow forces sync)
     window.relativeLineNumbers = {
-        update: updateLineMarkers,
+        update: scheduleLineUpdate,
+        updateNow: updateLineMarkers,
         toggle: toggleLineNumbers,
         clear: clearMarkers
     };
